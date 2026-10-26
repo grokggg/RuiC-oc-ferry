@@ -14,6 +14,7 @@ import { prepare, BridgeError } from './protocol.js';
 import { PROBE_TIMEOUT, probeBody, probeModel, probeFailure, formatUnsupported } from './probe.js';
 import { modelResult, withRequestMeta, usableModelIds } from './model-status.js';
 import { atomicWrite, syncModels } from './sync.js';
+import { syncDshProvider, listDshProfiles, locateDshHome } from './dsh-config.js';
 import { createProbeCache } from './probe-cache.js';
 
 // 服务端进程：Electron 以 fork 方式拉起它，也可以直接 `npm start` 独立运行。
@@ -36,8 +37,14 @@ const endpoint = `http://127.0.0.1:${port}/v1`;
 let models = [], runtime, binary, stopping = false, refreshing;
 let previous = {};
 try { previous = JSON.parse(await fs.readFile(path.join(dataDir, 'status.json'), 'utf8')); } catch {}
+// 写入目标：WorkBuddy 的 models.json，或 DSH 各 profile 的 cordis.patch.yml。
+// 同一时间只认一个目标，切换时把旧目标里自己的条目摘干净。
+const dshHome = locateDshHome();
+let dshProfiles = await listDshProfiles(dshHome);
+const dshAttachment = () => ({ home: dshHome, profiles: dshProfiles.map(profile => profile.name) });
+const target = settings.target === 'dsh' ? 'dsh' : 'workbuddy';
 // 状态里会带上一轮留下的检测结果：重启后面板不至于一片空白，但也不当成新结论。
-let state = { useSystemProxy: settings.useSystemProxy === true || (process.platform === 'win32' && settings.useSystemProxy !== false), phase: 'starting', message: '正在启动', endpoint, pid: process.pid, version: '0.2.0', opencodeVersion: null, models: [], excludedModels: settings.excludedModels || [], modelResults: previous.modelResults || {}, sync: null, availableModels: [], probe: { running: false } };
+let state = { useSystemProxy: settings.useSystemProxy === true || (process.platform === 'win32' && settings.useSystemProxy !== false), phase: 'starting', message: '正在启动', endpoint, pid: process.pid, version: '0.2.0', opencodeVersion: null, models: [], excludedModels: settings.excludedModels || [], modelResults: previous.modelResults || {}, sync: null, availableModels: [], probe: { running: false }, target, dsh: dshAttachment() };
 // 状态写入串行化：一个慢的异步更新不能盖掉后发生的状态。
 let statusWrites = Promise.resolve();
 function update(patch) {
@@ -80,17 +87,24 @@ let modelsFile = process.platform === 'win32'
   : process.env.FERRY_MODELS_FILE || path.join(os.homedir(), '.workbuddy/models.json');
 update({ modelsFile });
 
-// 导入 WorkBuddy 的写操作也串行化：两次并发导入会把同一份配置写乱。
+// 两个目标的写入形态不同：WorkBuddy 吃一份 models.json 清单，
+// DSH 吃 profile patch 里的 llm-pi-ai provider。对外都返回 {changed, count, target}。
+async function writePublished(target, published) {
+  if (target === 'dsh')
+    return syncDshProvider(dshProfiles, published, endpoint, key, { allowEmpty: true });
+  if (!modelsFile) throw new Error('未找到有效的 WorkBuddy 配置，请点击导入并选择 models.json；首次使用请先在 WorkBuddy 保存一个自定义模型。');
+  return syncModels(modelsFile, published, `${endpoint}/chat/completions`, key, { allowEmpty: true, requireExisting: process.platform === 'win32' });
+}
+
+// 导入的写操作也串行化：两次并发写入会把同一份配置写乱。
 function syncPublished(published = publishedModels().filter(m => !(settings.excludedModels || []).includes(m.id))) {
   syncWrites = syncWrites.then(async () => {
     let sync;
-    if (process.env.FERRY_NO_SYNC === '1') sync = { skipped: true, count: published.length };
+    const active = state.target || 'workbuddy';
+    if (process.env.FERRY_NO_SYNC === '1') sync = { skipped: true, count: published.length, target: active };
     else {
-      try {
-        if (!modelsFile) throw new Error('未找到有效的 WorkBuddy 配置，请点击导入并选择 models.json；首次使用请先在 WorkBuddy 保存一个自定义模型。');
-        sync = await syncModels(modelsFile, published, `${endpoint}/chat/completions`, key, { allowEmpty: true, requireExisting: process.platform === 'win32' });
-      }
-      catch (e) { sync = { error: e.message }; }
+      try { sync = await writePublished(active, published); }
+      catch (e) { sync = { error: e.message, target: active }; }
     }
     update({ sync: { ...sync, time: new Date().toISOString() } });
     return sync;
@@ -364,6 +378,15 @@ async function selectModel(model, selected) {
 
 async function importModels(selectedFile) {
   if (stopping || probing || refreshing || configSearch || state.phase !== 'ready') throw new Error('请等待读取和检测完成后导入');
+  if (state.target === 'dsh') {
+    // profile 可能是应用启动后才出现的（先开 DSH 再开 OC Ferry 之外的顺序），
+    // 每次写入前重扫一次，不把一份过期目录当成事实。
+    dshProfiles = await listDshProfiles(dshHome);
+    update({ dsh: dshAttachment() });
+    const sync = await syncPublished();
+    if (sync.error) throw new Error(sync.error);
+    return sync;
+  }
   if (selectedFile !== undefined) {
     await validateModelsFile(selectedFile);
     // 换配置文件之前，先从旧文件里摘掉自己的条目——不然它们会永远留在那儿没人认领。
@@ -378,6 +401,30 @@ async function importModels(selectedFile) {
   const sync = await syncPublished();
   if (sync.error) throw new Error(sync.error);
   return sync;
+}
+
+// 切换写入目标：旧目标先摘掉自己的条目（否则两处都会指向这个本机转发口，
+// 关掉 OC Ferry 后留下两份死配置），再持久化选择、立刻把当前勾选写进新目标。
+async function setTarget(next) {
+  if (!['workbuddy', 'dsh'].includes(next)) throw new Error('无效的写入目标');
+  if (stopping || probing || refreshing || configSearch || state.phase !== 'ready') throw new Error('请等待读取和检测完成');
+  if (state.target === next) return { target: next, changed: false, count: 0 };
+  dshProfiles = await listDshProfiles(dshHome);
+  if (next === 'dsh' && !dshProfiles.length) throw new Error('未检测到 DSH 配置；请先启动一次 DeepSeek Harness（~/.dsh/profiles）');
+  // 等排队中的自动写入落完再清理：否则一次轮末同步可能在切换后又写回旧目标。
+  await syncWrites;
+  const previous = state.target || 'workbuddy';
+  try {
+    if (previous === 'dsh' && dshProfiles.length) await syncDshProvider(dshProfiles, [], endpoint, key, { allowEmpty: true });
+    else if (previous === 'workbuddy' && modelsFile) await writePublished('workbuddy', []);
+  } catch (error) { throw new Error('清理原写入目标失败：' + error.message); }
+  const updated = { ...settings, target: next };
+  await atomicWrite(settingsFile, JSON.stringify(updated));
+  settings = updated;
+  update({ target: next, dsh: dshAttachment() });
+  const sync = await syncPublished();
+  if (sync.error) throw new Error(sync.error);
+  return { ...sync, target: next };
 }
 
 async function shutdown(code = 0) {
@@ -434,7 +481,7 @@ try {
     },
     log: message => log.write(`${new Date().toISOString()} ${message}\n`),
   });
-  server = createServer({ server, key, selectModel, backend: { complete: (...args) => runtime.backend.complete(...args) }, getModels: publishedModels, refresh: readModels, importModels, findConfig, setSystemProxy,
+  server = createServer({ server, key, selectModel, backend: { complete: (...args) => runtime.backend.complete(...args) }, getModels: publishedModels, refresh: readModels, importModels, findConfig, setSystemProxy, setTarget,
     status: () => state, probe: startProbes, onResult: record, onActivity: noteActivity });
   update({ message: '正在启动隔离模型服务' });
   runtime = attachTranslator(await startBackend(binary, dataDir, log, startupProxyEnv));

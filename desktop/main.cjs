@@ -10,9 +10,6 @@ const { activityText } = require('./activity.cjs');
 // src/main.js 里，这样同一个核心既能被桌面端驱动，也能 `npm start` 单跑。
 app.setName('OC Ferry');
 app.setAppUserModelId('local.ruic.oc-ferry');
-// 开机自启（安装包写的那条快捷方式）带 --hidden：只有托盘和后台服务，不弹窗。
-// 用户自己双击桌面图标时不带这个参数，照常把窗口打开。
-const startHidden = process.argv.includes('--hidden');
 let window, tray, service, timer, log, quitting = false, mayQuit = false, actionBusy = false;
 let state = { phase: 'starting', message: '正在启动隔离模型服务', models: [], modelResults: {} };
 let dataDir, lastMenu = '';
@@ -56,8 +53,12 @@ function publish() {
     { label: '打开控制面板', click: showWindow }, { type: 'separator' },
     { label: '重新扫描免费模型', enabled: !busy, click: () => trayAction('refresh') },
     { label: '检测全部模型', enabled: !busy, click: () => trayAction('probe') },
-    { label: '导入 WorkBuddy', enabled: !busy, click: () => trayAction('import') },
-    ...(process.platform === 'win32' ? [{ label: '自动查找 WorkBuddy 配置…', enabled: !busy, click: () => trayAction('find-config') }, { label: '选择 WorkBuddy 配置…', enabled: !busy, click: () => trayAction('choose-config') }] : []),
+    { label: state.target === 'dsh' ? '写入 DSH' : '导入 WorkBuddy', enabled: !busy, click: () => trayAction('import') },
+    { label: '写入目标', submenu: [
+      { label: 'WorkBuddy', type: 'radio', checked: state.target !== 'dsh', enabled: !busy, click: () => trayAction('target', 'workbuddy') },
+      { label: 'DSH', type: 'radio', checked: state.target === 'dsh', enabled: !busy, click: () => trayAction('target', 'dsh') },
+    ] },
+    ...(process.platform === 'win32' && state.target !== 'dsh' ? [{ label: '自动查找 WorkBuddy 配置…', enabled: !busy, click: () => trayAction('find-config') }, { label: '选择 WorkBuddy 配置…', enabled: !busy, click: () => trayAction('choose-config') }] : []),
     { label: '模型状态', submenu: (state.models || []).map(m => ({ label: `OC · ${m.name} · ${available.has(m.id) ? state.modelResults?.[m.id]?.chatOnly ? '可用 · 仅对话' : '可用' : '不可用'}`, enabled: false })) },
     { type: 'separator' }, { label: '退出 OC Ferry', click: () => app.quit() },
   ]));
@@ -70,7 +71,7 @@ async function readState() {
   } catch {}
 }
 async function action(name, value) {
-  if (!['refresh', 'probe', 'import', 'system-proxy', 'restart', 'choose-config', 'find-config', 'selection'].includes(name)) throw new Error('未知操作');
+  if (!['refresh', 'probe', 'import', 'system-proxy', 'restart', 'choose-config', 'find-config', 'selection', 'target'].includes(name)) throw new Error('未知操作');
   if (state.configSearch?.running) throw new Error('请等待配置查找完成');
   if (actionBusy) throw new Error('请等待当前操作完成');
   if (name === 'restart') {
@@ -84,7 +85,7 @@ async function action(name, value) {
   try {
     let modelsFile;
     // Windows 上先尝试自动查找配置：找到就转成 import，没找到再让用户手动选。
-    if (process.platform === 'win32' && (name === 'find-config' || (name === 'import' && (!state.modelsFile || !(await fs.stat(state.modelsFile).catch(() => null))?.isFile())))) {
+    if (process.platform === 'win32' && state.target !== 'dsh' && (name === 'find-config' || (name === 'import' && (!state.modelsFile || !(await fs.stat(state.modelsFile).catch(() => null))?.isFile())))) {
       let found = state.configSearch;
       if (name === 'find-config' || !found?.candidates?.length) {
         const key = (await fs.readFile(path.join(dataDir, 'api-key'), 'utf8')).trim();
@@ -113,21 +114,25 @@ async function action(name, value) {
     const endpoint = `http://127.0.0.1:${Number(process.env.FERRY_PORT || 41980)}`;
     const response = await fetch(`${endpoint}/admin/${name}`, { method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(name === 'system-proxy' ? { enabled: value } : name === 'selection' ? value : name === 'probe' && typeof value === 'string' ? { model: value } : modelsFile ? { modelsFile } : {}), signal: AbortSignal.timeout(150000) });
+      body: JSON.stringify(name === 'system-proxy' ? { enabled: value } : name === 'selection' ? value : name === 'target' ? { target: value } : name === 'probe' && typeof value === 'string' ? { model: value } : modelsFile ? { modelsFile } : {}), signal: AbortSignal.timeout(150000) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error?.message || `HTTP ${response.status}`);
     await readState();
     return result;
   } finally { actionBusy = false; publish(); }
 }
-async function trayAction(name) {
+async function trayAction(name, value) {
   try {
-    const result = await action(name);
-    if (['import', 'choose-config', 'find-config'].includes(name) && !result.canceled) await dialog.showMessageBox({ type: 'info', title: 'OC Ferry', message: '导入完成', detail: importMessage(result) });
+    const result = await action(name, value);
+    if (['import', 'choose-config', 'find-config', 'target'].includes(name) && !result.canceled) await dialog.showMessageBox({
+      type: 'info', title: 'OC Ferry', message: name === 'target' ? `已切换到 ${targetName(result)}` : result.changed === false ? '配置已是最新' : '写入完成', detail: importMessage(result) });
   } catch (e) { await dialog.showMessageBox({ type: 'error', title: 'OC Ferry', message: '操作失败', detail: e.message }); }
 }
+function targetName(result) {
+  return result?.target === 'dsh' ? 'DSH' : 'WorkBuddy';
+}
 function importMessage(result) {
-  return result.changed === false ? `WorkBuddy 配置已是最新，共 ${result.count} 个模型，无需重复写入。` : `已将 ${result.count} 个可用模型导入 WorkBuddy。`;
+  return result.changed === false ? `${targetName(result)} 配置已是最新，共 ${result.count} 个模型，无需重复写入。` : `已将 ${result.count} 个可用模型写入 ${targetName(result)}。`;
 }
 async function startService() {
   await fs.mkdir(dataDir, { recursive: true });
@@ -180,13 +185,13 @@ else {
       try {
         const result = await action(name, value);
         if (name === 'import' && !result.canceled) await dialog.showMessageBox(window, {
-          type: 'info', title: 'OC Ferry', message: result.changed === false ? '配置已是最新' : '导入完成',
+          type: 'info', title: 'OC Ferry', message: result.changed === false ? '配置已是最新' : `已写入 ${targetName(result)}`,
           detail: importMessage(result), buttons: ['确定'], defaultId: 0, cancelId: 0,
         });
         return { ok: true, result };
       } catch (error) {
         if (name === 'import') await dialog.showMessageBox(window, {
-          type: 'error', title: 'OC Ferry', message: '导入失败', detail: error.message, buttons: ['确定'], defaultId: 0, cancelId: 0,
+          type: 'error', title: 'OC Ferry', message: `写入 ${state.target === 'dsh' ? 'DSH' : 'WorkBuddy'} 失败`, detail: error.message, buttons: ['确定'], defaultId: 0, cancelId: 0,
         });
         return { ok: false, error: error.message };
       }
@@ -196,8 +201,6 @@ else {
     if (process.platform === 'darwin') trayIcon.setTemplateImage(true);
     tray = new Tray(trayIcon);
     tray.on('click', showWindow);
-    // 自启动只留托盘：窗口等用户点托盘图标再建，省得每次开机都糊一屏。
-    if (startHidden) publish(); else showWindow();
-    await startService();
+    showWindow(); publish(); await startService();
   }).catch(error => { dialog.showErrorBox('启动失败', error.message); app.quit(); });
 }

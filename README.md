@@ -1,20 +1,22 @@
 <div align="center">
   <img src="desktop/icon.png" width="112" alt="OC Ferry">
   <h1>OC Ferry</h1>
-  <p><b>把 OpenCode 的免费模型摆渡给 WorkBuddy</b></p>
-  <p>跨平台托盘应用 · 无需登录注册、无需 API Key · 隔离运行时 · 并发检测 · 判定缓存 · 一键导入 · 本机 OpenAI 兼容转发口</p>
+  <p><b>把 OpenCode 的免费模型摆渡给 WorkBuddy 与 DSH</b></p>
+  <p>跨平台托盘应用 · 无需登录注册、无需 API Key · 隔离运行时 · 并发检测 · 判定缓存 · 一键写入 · 本机 OpenAI 兼容转发口</p>
 
   <img alt="许可证" src="https://img.shields.io/badge/license-MIT-3b6ea5?style=flat-square">
   <img alt="平台" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-4b6fff?style=flat-square">
   <img alt="Node" src="https://img.shields.io/badge/node-%3E%3D22-2f6f4f?style=flat-square">
-  <img alt="测试" src="https://img.shields.io/badge/tests-85%20passed-2f6f4f?style=flat-square">
+  <img alt="测试" src="https://img.shields.io/badge/tests-92%20passed-2f6f4f?style=flat-square">
 </div>
 
 ---
 
+> **⬇️ [下载最新版](https://github.com/HRuiCcc/RuiC-oc-ferry/releases/latest)** · macOS（Apple 芯片）/ Windows
+
 WorkBuddy 支持在它的 `models.json` 里填自定义模型。OpenCode 的免费模型池是现成的免费额度，但它不是一个能直接填进去的 OpenAI 端点：目录里带 `free` 的模型不一定免费，能聊天不等于能按 WorkBuddy 的方式产生工具调用，而且免费池随时上下线。
 
-**OC Ferry 就是中间这一层**：在数据目录里放一份**隔离的** OpenCode，按**价格**筛出免费模型，逐个探测它们能不能按 WorkBuddy 的工具协议干活，把通过的写进你的 `models.json`，再起一个只监听本机的转发口供 WorkBuddy 调用。
+**OC Ferry 就是中间这一层**：在数据目录里放一份**隔离的** OpenCode，按**价格**筛出免费模型，逐个探测它们能不能按客户端的工具协议干活，把通过的写进 WorkBuddy 的 `models.json` 或 **DSH（DeepSeek Harness）** 各 profile 的 `cordis.patch.yml`，再起一个只监听本机的转发口供客户端调用。界面上的「写入目标」随时在两者之间切换。
 
 ## 界面
 
@@ -39,9 +41,9 @@ flowchart LR
   C -->|只回文本| E["可用 · 仅对话<br/>工具关闭"]
   C -->|超时 / 限流| F["记录原因<br/>10 分钟后自动重试"]
   C -->|已下线 / 无权限| G["记录原因<br/>1 小时后重试"]
-  D --> H["写入 WorkBuddy<br/>models.json"]
+  D --> H["写入所选目标<br/>WorkBuddy models.json<br/>或 DSH cordis.patch.yml"]
   E --> H
-  H --> I["WorkBuddy"]
+  H --> I["WorkBuddy / DSH"]
   I -->|"OpenAI 兼容请求"| J["本机转发口<br/>127.0.0.1:41980"]
   J --> K["适配器：JSON 信封协议<br/>审批围栏 · 动作转交"]
   K --> B
@@ -53,12 +55,12 @@ flowchart LR
 1. **发现**：只看价格字段（输入/输出/缓存读写全为 0）才算免费，名字里带 `free` 不算数；已声明 `deprecated` 的直接排除。
 2. **体检**：给 5 个工具、自由选择，让它读一个带随机 token 的文件。**只回文本不算失败**——按「可用 · 仅对话」发布并关掉工具；动作不符重试一次；超时与格式失败不重试。
 3. **提速**：检测 3 路并发（一轮约 60 秒）；判定按模型缓存，成功保留 6 小时、当时的负载只保留 10 分钟——**重启基本是秒开，不会每次都全量重测**。
-4. **导入**：只增删自己标记过的条目，你手写的一条都不动；写前备份、加锁、原子替换，内容没变就不写；退出时把自己的条目摘干净。
-5. **转发**：模型只能回一个 JSON 信封表达动作，**执行权始终在 WorkBuddy 手里**——任何本机动作一律被拒绝或转交成外部工具调用，模型永远不会自己动手。
+4. **写入**：WorkBuddy 只增删自己标记过的条目；DSH 只增删 `llm-pi-ai` 里的 `oc-ferry` provider（**不碰你其它 provider**，patch 是按 id 整段替换 config 的，所以必须合并进同一条）。两边都写前备份、原子替换，内容没变就不写；退出时把自己的条目摘干净。
+5. **转发**：模型只能回一个 JSON 信封表达动作，**执行权始终在客户端手里**——任何本机动作一律被拒绝或转交成外部工具调用，模型永远不会自己动手。
 
 ## 用法
 
-先安装 WorkBuddy。**不需要另外装 Node.js**（打包后的应用用 Electron 自带的 Node 跑后台服务）。
+先安装 WorkBuddy 或 DeepSeek Harness（DSH）。**不需要另外装 Node.js**（打包后的应用用 Electron 自带的 Node 跑后台服务）。
 
 - **macOS（Apple 芯片）**：下载 `OC-Ferry-<版本>-mac-arm64.dmg`（仓库右侧 Releases 里），双击打开，把 `OC Ferry` 拖进「应用程序」，再双击打开。未做 Apple 公证，首次打开可能要右键 →「打开」；若提示「已损坏」，先核对 Release 说明里的 sha256，再移除下载隔离标记：`xattr -dr com.apple.quarantine "/Applications/OC Ferry.app"`。也可以下载 zip，解压后把 `OC Ferry.app` 拖进「应用程序」。
 - **Windows**：运行 `OC-Ferry-Setup-<版本>-win-x64.exe`，装完桌面就有了图标，双击即开。
@@ -66,11 +68,12 @@ flowchart LR
   因此装完就等于「一直连着」——不用每次先开一次应用，WorkBuddy 里的免费模型才在。
   （只想要绿色版的话用 `npm run build:win:portable`；portable 包必须完整解压，不要只复制 exe。）
 
-首次启动会自动准备 OpenCode、扫描免费模型并逐个检测，**检测完自动导入一次**。之后重新检测或读取**不会**自动改 WorkBuddy，需要点「导入 WorkBuddy」。
+首次启动会自动准备 OpenCode、扫描免费模型并逐个检测，**检测完自动写入一次**。之后重新检测或读取**不会**自动改客户端，需要点「导入 WorkBuddy」或「写入 DSH」。
 
 几个日常操作：
 
-- **关窗口 ≠ 退出**：关掉窗口它继续在托盘跑；从托盘退出时会把自己导入的条目摘掉（保留你手写的），所以这些模型可用期间请让它常驻。
+- **关窗口 ≠ 退出**：关掉窗口它继续在托盘跑；从托盘退出时会把自己写入的条目摘掉（保留你手写的），所以这些模型可用期间请让它常驻。
+- **切换写入目标**：控制面板右上「写入目标」点 **DSH** 即可；切换到 DSH 会把当前勾选写进所有已检测到的 DSH profile（`~/.dsh/profiles/*/cordis.patch.yml`），同时清掉 WorkBuddy 里自己写过的那批条目，反之亦然。切换后重启一次 DSH 才会看到 `OC Ferry` 分组。
 - **想重新验证**：点「检测全部」强制重测一轮；只想重测某一个，在它的详情里点「只重测这一个」。
 - **主题**：工具栏右上角可在**系统 / 浅色 / 深色**之间切换，选择会记住。
 
@@ -78,7 +81,7 @@ flowchart LR
 
 ```sh
 npm ci
-npm test              # 85 项自动测试，不访问网络
+npm test              # 92 项自动测试，不访问网络
 npm run desktop       # 起 Electron（窗口 + 托盘 + 后台服务）
 npm start             # 只起后台服务（无界面），用于调试
 npm run build:mac     # 打 macOS 的 .app + zip + dmg（ad-hoc 签名 + 深度严格校验）
@@ -89,15 +92,15 @@ npm run build:win:portable   # 打 Windows 便携版（不写注册表、不自�
 
 ### 数据目录
 
-| 系统 | 应用数据 | WorkBuddy 配置 |
-|---|---|---|
-| macOS | `~/Library/Application Support/OC Ferry` | `~/.workbuddy/models.json` |
-| Windows | `%APPDATA%\OC Ferry` | `%USERPROFILE%\.workbuddy\models.json` |
-| Linux（实验性） | `$XDG_CONFIG_HOME/OC Ferry` | `~/.workbuddy/models.json` |
+| 系统 | 应用数据 | WorkBuddy 配置 | DSH 配置 |
+|---|---|---|---|
+| macOS | `~/Library/Application Support/OC Ferry` | `~/.workbuddy/models.json` | `~/.dsh/profiles/*/cordis.patch.yml` |
+| Windows | `%APPDATA%\OC Ferry` | `%USERPROFILE%\.workbuddy\models.json` | `%USERPROFILE%\.dsh\profiles\*\cordis.patch.yml` |
+| Linux（实验性） | `$XDG_CONFIG_HOME/OC Ferry` | `~/.workbuddy/models.json` | `~/.dsh/profiles/*/cordis.patch.yml` |
 
 数据目录里：`api-key`（本机转发口的密钥）、`status.json`、`settings.json`、`probe-cache.json`（判定缓存）、`runtime/`（托管运行时）、`opencode/`（隔离 OpenCode 自己的目录）。
 
-**环境变量**（调试用）：`FERRY_DATA_DIR`、`FERRY_PORT`（默认 41980）、`FERRY_MODELS_FILE`、`FERRY_NO_SYNC=1`（完全不写 WorkBuddy）、`FERRY_OPENCODE_PATH`、`FERRY_PROBE_CONCURRENCY`（并发度，默认 3，上限 6）、`FERRY_PROBE_TTL_MINUTES`（成功判定有效期，默认 360 分钟）、`WORKBUDDY_CONFIG_DIR` / `WORKBUDDY_DATA_FOLDER_NAME`。
+**环境变量**（调试用）：`FERRY_DATA_DIR`、`FERRY_PORT`（默认 41980）、`FERRY_MODELS_FILE`、`FERRY_NO_SYNC=1`（完全不写客户端配置）、`DSH_HOME`（默认 `~/.dsh`）、`FERRY_OPENCODE_PATH`、`FERRY_PROBE_CONCURRENCY`（并发度，默认 3，上限 6）、`FERRY_PROBE_TTL_MINUTES`（成功判定有效期，默认 360 分钟）、`WORKBUDDY_CONFIG_DIR` / `WORKBUDDY_DATA_FOLDER_NAME`。
 
 ### 本机接口
 
@@ -108,6 +111,7 @@ GET  /health                 # 完整状态
 GET  /v1/models              # 已判定可用的模型（id 为 "OC · 名字"）
 POST /v1/chat/completions    # 转发，支持 stream；并发上限 4
 POST /admin/refresh | /admin/probe | /admin/import | /admin/selection
+POST /admin/target          # {target:"workbuddy"|"dsh"} 切换写入目标并立即写入
 POST /admin/system-proxy | /admin/find-config
 ```
 
@@ -115,7 +119,7 @@ POST /admin/system-proxy | /admin/find-config
 
 ```
 src/
-  main.js            编排：状态机 / 检测队列 / 刷新 / 导入 / 退出清理
+  main.js            编排：状态机 / 检测队列 / 刷新 / 写入目标 / 退出清理
   backend.js         OpenCode 会话、审批围栏、事件流、动作转交与翻译
   runtime.js         运行时发现·下载·校验·隔离启动
   protocol.js        请求校验 / 信封编解码 / usage 换算 / SSE
@@ -125,6 +129,7 @@ src/
   handoff.js         本机动作 → 外部工具的映射与 schema 复核
   config-finder.js   Windows 配置查找（只读）
   sync.js            models.json 的合并 / 加锁 / 备份 / 原子写
+  dsh-config.js      DSH profile patch 的 provider 合并 / 摘除 / 备份
   server.js          本机 HTTP 面（鉴权、来源围栏、转发）
   platform.js  system-proxy.js  atomic.js  json.js
   service-instance.js  model-status.js  reasoning.js  workbuddy-config.js
@@ -133,7 +138,7 @@ desktop/
   preload.cjs        只暴露状态订阅与固定动作
   index.html  style.css  renderer.js   控制面板
   activity.cjs       托盘与面板共用的阶段文案
-test/                85 项自动测试
+test/                92 项自动测试
 docs/
   设计说明.md         架构、协议、机制与边界（模块地图 / 信封协议 / 审批围栏 / 缓存策略）
   screenshots/       界面截图
@@ -143,7 +148,7 @@ docs/
 
 - 启动后会自动发送简短的检测请求，**会使用少量免费额度**；检测通过只代表"这一次能按协议产生动作"，不代表完整工作流都验证过。
 - 界面上的耗时是**完整请求用时**，不是首字延迟；剩余额度上游不提供，查不到。
-- 不可用的模型只在窗口里保留记录，**不会**提供给 WorkBuddy。
+- 不可用的模型只在窗口里保留记录，**不会**提供给客户端。
 - 免费模型与额度由上游决定，随时可能变化。
 - 系统代理只支持手动 HTTP/HTTPS 配置，**不支持 PAC/SOCKS**。
 

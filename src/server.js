@@ -20,7 +20,7 @@ async function readBody(req) {
 }
 function json(res, status, data) { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); }
 
-export function createServer({ server = http.createServer(), key, selectModel, backend, getModels, refresh, importModels, findConfig, setSystemProxy, probe, status, onResult = () => {}, onActivity }) {
+export function createServer({ server = http.createServer(), key, selectModel, backend, getModels, refresh, importModels, findConfig, setSystemProxy, setTarget, probe, status, onResult = () => {}, onActivity }) {
   const active = new Set();
   server.removeAllListeners('request');
   server.on('request', async (req, res) => {
@@ -47,6 +47,7 @@ export function createServer({ server = http.createServer(), key, selectModel, b
         return json(res, 200, await selectModel(body.model, body.selected));
       }
       if (req.method === 'POST' && route === '/admin/import') return json(res, 200, await importModels((await readBody(req)).modelsFile));
+      if (req.method === 'POST' && route === '/admin/target') return json(res, 200, await setTarget((await readBody(req)).target));
       if (req.method === 'POST' && route === '/admin/refresh') return json(res, 200, await refresh());
       if (req.method !== 'POST' || route !== '/v1/chat/completions') return json(res, 404, { error: { message: 'Not found' } });
       if (active.size > 4) throw new BridgeError('At most four requests may run at once', 429, 'busy');

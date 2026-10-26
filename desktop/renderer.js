@@ -92,6 +92,25 @@ function chatOnly(model) {
   return !!(state.modelResults?.[model.id]?.chatOnly || model.chatOnly);
 }
 
+// 写入目标的三种文案（名词 / 按钮 / 路径）集中在这里，
+// 免得界面上一处说 WorkBuddy、另一处还在说旧目标。
+function targetName(value = state.target) {
+  return value === 'dsh' ? 'DSH' : 'WorkBuddy';
+}
+
+function writeLabel() {
+  return state.target === 'dsh' ? '写入 DSH' : '导入 WorkBuddy';
+}
+
+function targetPath() {
+  if (state.target === 'dsh') {
+    const profiles = state.dsh?.profiles || [];
+    if (!profiles.length) return '未检测到 DSH profile；请先启动一次 DeepSeek Harness';
+    return `${state.dsh.home}/profiles/{${profiles.join(', ')}}/cordis.patch.yml`;
+  }
+  return state.modelsFile || '尚未定位配置文件，导入时查找或选择';
+}
+
 function label(model) {
   if (probing(model.id)) return activeProbe(model.id) ? '检测中' : '等待检测';
   if (requesting(model.id)) return '请求中';
@@ -154,9 +173,9 @@ function detailRow(model, detailId) {
 
   const events = element('div', 'detail-events');
   const add = (text, className = '') => events.append(element('p', className, text));
-  if (chatOnly(model)) add('已自动关闭工具调用；导入后仅支持普通对话。');
+  if (chatOnly(model)) add(`已自动关闭工具调用；写入 ${targetName()} 后仅支持普通对话。`);
   if (Number.isInteger(result.nativeAttempts) && result.nativeAttempts > 0) {
-    add(`最近一次调用拦截了 ${result.nativeAttempts} 次本地执行尝试，动作必须由 WorkBuddy 执行。`, 'warning-text');
+    add(`最近一次调用拦截了 ${result.nativeAttempts} 次本地执行尝试，动作必须由客户端执行。`, 'warning-text');
   }
   if (Number.isInteger(result.calls) && result.calls > 0) add(`最近一次调用返回了 ${result.calls} 个动作。`);
   if (result.handoff) add(`最近一次调用把被拦下的本地动作转交成外部 ${result.handoff} 调用。`);
@@ -192,7 +211,7 @@ function renderModels() {
   // 活动计时仅更新状态条。行内容未变时保留 DOM，避免轮询打断滚动和键盘操作。
   const signature = JSON.stringify([
     state.models, state.modelResults, state.probe, state.availableModels, state.excludedModels,
-    (state.activity || []).map(activity => activity.model), controlsBusy(), state.phase, selected
+    (state.activity || []).map(activity => activity.model), controlsBusy(), state.phase, state.target, selected
   ]);
   if (signature === lastSignature) return;
   lastSignature = signature;
@@ -215,7 +234,7 @@ function renderModels() {
     choose.dataset.control = 'selection';
     choose.checked = !!state.availableModels?.includes(model.id) && !(state.excludedModels || []).includes(model.id);
     choose.disabled = controlsBusy() || !state.availableModels?.includes(model.id);
-    choose.setAttribute('aria-label', `导入 OC · ${model.name}`);
+    choose.setAttribute('aria-label', `选择 OC · ${model.name}`);
     choose.addEventListener('click', event => event.stopPropagation());
     choose.addEventListener('change', () => run('selection', { model: model.id, selected: choose.checked }));
     checkCell.append(choose);
@@ -293,30 +312,35 @@ function renderAction(id, title, busyTitle, active) {
 
 function syncText() {
   if (state.configSearch?.running) return 'OpenCode 正在只读查找 WorkBuddy 配置…';
-  if (state.configSearch?.candidates?.length > 1 && !state.modelsFile) return '已找到配置文件，点击导入 WorkBuddy 使用最近访问的一份。';
+  if (state.configSearch?.candidates?.length > 1 && !state.modelsFile && state.target !== 'dsh') return '已找到配置文件，点击导入 WorkBuddy 使用最近访问的一份。';
   if (state.sync?.error) return state.sync.error;
-  if (state.sync?.time) return `已导入 ${state.sync.count ?? 0} 个模型 · 再次检测后需点击导入 WorkBuddy 更新`;
-  return '首次读取和检测完成后自动导入 WorkBuddy';
+  if (state.sync?.time) return `已写入 ${state.sync.count ?? 0} 个模型到 ${targetName(state.sync.target)} · 再次检测后需点击${writeLabel()} 更新`;
+  return `首次读取和检测完成后自动写入${targetName()}`;
 }
 
 function render() {
   const busy = controlsBusy();
   for (const id of ['refresh', 'probe', 'import']) $(id).disabled = busy;
+  for (const button of document.querySelectorAll('[data-target-choice]')) {
+    button.disabled = busy;
+    button.setAttribute('aria-pressed', String(button.dataset.targetChoice === (state.target === 'dsh' ? 'dsh' : 'workbuddy')));
+  }
   $('restart').hidden = state.phase !== 'error';
   $('restart').disabled = operationBusy();
   $('proxy').disabled = operationBusy() || !['ready', 'error'].includes(state.phase);
   $('proxy').checked = state.useSystemProxy === true;
   renderAction('refresh', '读取免费模型', '正在读取…', pendingAction === 'refresh' || state.actionBusy === 'refresh');
   renderAction('probe', '检测全部', '正在检测…', pendingAction === 'probe' || state.actionBusy === 'probe' || state.probe?.running);
-  renderAction('import', '导入 WorkBuddy', '正在导入…', pendingAction === 'import' || state.actionBusy === 'import');
+  renderAction('import', writeLabel(), state.target === 'dsh' ? '正在写入…' : '正在导入…', pendingAction === 'import' || state.actionBusy === 'import');
 
   setText('discovered', state.models?.length || 0);
   setText('available', state.availableModels?.length || 0);
   setText('pending', state.models?.filter(model => rank(model) === 1).length || 0);
   const chosen = (state.availableModels || []).filter(id => !(state.excludedModels || []).includes(id)).length;
   setText('selected-count', `已选 ${chosen} 个可用模型`);
-  setText('target-file', state.modelsFile || '尚未定位配置文件，导入时查找或选择');
-  $('target-file').title = state.modelsFile || '';
+  const path = targetPath();
+  setText('target-file', path);
+  $('target-file').title = state.target === 'dsh' ? path : state.modelsFile || '';
   setText('sync', syncText());
   $('sync').classList.toggle('error-text', !!state.sync?.error && syncText() === state.sync.error);
 
@@ -342,6 +366,7 @@ function canRun(name, value) {
   if (name === 'restart') return state.phase === 'error';
   if (name === 'system-proxy') return ['ready', 'error'].includes(state.phase);
   if (state.phase !== 'ready') return false;
+  if (name === 'target') return ['workbuddy', 'dsh'].includes(value) && value !== state.target;
   return name !== 'selection' || !!state.availableModels?.includes(value?.model);
 }
 
@@ -355,13 +380,23 @@ async function run(name, value) {
     if (!response.ok) throw new Error(response.error);
     if (name === 'selection') {
       state.excludedModels = response.result.excludedModels;
-      feedback('选择已保存，点击导入 WorkBuddy 后生效。');
+      feedback(`选择已保存，点击${writeLabel()} 后生效。`);
     }
     if (name === 'import') {
       const result = response.result;
-      feedback(result.canceled ? '已取消导入，配置未更改。'
-        : result.changed === false ? `配置已是最新，共 ${result.count} 个模型，无需重复写入。`
-        : `导入完成，已将 ${result.count} 个可用模型导入 WorkBuddy。`);
+      const target = targetName(result.target);
+      feedback(result.canceled ? '已取消写入，配置未更改。'
+        : result.changed === false ? `${target} 配置已是最新，共 ${result.count} 个模型，无需重复写入。`
+        : `写入完成，已将 ${result.count} 个可用模型写入 ${target}。`);
+    }
+    if (name === 'target') {
+      const result = response.result;
+      state.target = result.target;
+      const target = targetName(result.target);
+      feedback(result.changed === false && result.count
+        ? `已切换到 ${target}，配置已是最新，共 ${result.count} 个模型。`
+        : result.count ? `已切换到 ${target}，写入 ${result.count} 个可用模型。`
+        : `已切换到 ${target}，当前没有勾选可用模型，配置已清空。`);
     }
   } catch (error) {
     feedback(error.message, true);
@@ -380,6 +415,9 @@ function feedback(text, error = false) {
 
 for (const action of ['refresh', 'probe', 'import', 'restart']) $(action).addEventListener('click', () => run(action));
 $('proxy').addEventListener('change', () => run('system-proxy', $('proxy').checked));
+for (const button of document.querySelectorAll('[data-target-choice]')) {
+  button.addEventListener('click', () => run('target', button.dataset.targetChoice));
+}
 
 // 主题：三档一键到位，不做循环切换——循环没法"直接回到系统"。
 for (const button of document.querySelectorAll('[data-theme-choice]')) {
