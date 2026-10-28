@@ -1,7 +1,8 @@
 name: Mirror upstream release assets
 
 # 把上游仓库某个 Release 的全部资产复制到本仓库同名 Release。
-# 运行在 GitHub 自己的 runner 上，资产在 GitHub 内网之间传输，不受本地出口带宽限制。
+# 运行在 GitHub 自己的 runner 上，资产在 GitHub 内网之间传输，
+# 不受本地出口带宽限制（实测本地上传仅几 KB/s）。
 
 on:
   workflow_dispatch:
@@ -14,11 +15,6 @@ on:
         description: "Release tag，如 v0.4.0"
         required: true
         type: string
-      upload_ip:
-        description: "保留字段，无实际作用"
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: write
@@ -27,11 +23,11 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Fetch release metadata
-        id: meta
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM: ${{ inputs.upstream }}
           TAG: ${{ inputs.tag }}
         run: |
@@ -45,7 +41,7 @@ jobs:
           import json, pathlib
           d = json.load(open("release.json"))
           names = [a["name"] for a in d.get("assets", [])]
-          pathlib.Path("assets.txt").write_text("\n".join(names) + "\n")
+          pathlib.Path("assets.txt").write_text("\n".join(names) + ("\n" if names else ""))
           print("assets:", len(names))
           for n in names:
               print("  -", n)
@@ -53,7 +49,6 @@ jobs:
 
       - name: Download assets from upstream
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM: ${{ inputs.upstream }}
           TAG: ${{ inputs.tag }}
         run: |
@@ -61,73 +56,131 @@ jobs:
           cd dist
           while IFS= read -r name; do
             [ -z "$name" ] && continue
-            echo "downloading $name"
-            curl -fsSL --retry 5 --retry-all-errors \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/octet-stream" \
-              "https://api.github.com/repos/${UPSTREAM}/releases/tags/${TAG}" > /dev/null 2>&1 || true
+            echo "downloading: $name"
             gh release download "$TAG" --repo "$UPSTREAM" --pattern "$name" --dir . --clobber
             ls -l "$name"
           done < ../assets.txt
           echo "--- sha256 ---"
-          sha256sum * || true
+          sha256sum ./* || true
 
-      - name: Publish to this repository
+      - name: Create release via REST
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, subprocess, sys
-          tag = os.environ["TAG"]
+          import json, os, urllib.request, urllib.error
+          tag = os.environ["TAG"]; repo = os.environ["REPO"]
+          token = os.environ["GH_TOKEN"]
           meta = json.load(open("release.json"))
-          # 如果本仓库还没有该 release，先建一个
-          r = subprocess.run(
-              ["gh", "release", "view", tag, "--json", "tagName"],
-              capture_output=True, text=True)
-          if r.returncode != 0:
-              body = (meta.get("body") or "")[:60000]
-              subprocess.run(
-                  ["gh", "release", "create", tag,
-                   "--title", meta.get("name") or tag,
-                   "--notes", body or f"Mirror of {meta.get('tag_name')}",
-                  ],
-                  check=True)
-              print("created release", tag)
-          else:
-              print("release exists", tag)
-          PY
-          for f in dist/*; do
-            echo "uploading $f"
-            gh release upload "$TAG" "$f" --clobber
-          done
 
-      - name: Verify uploaded assets
+          def api(method, path, payload=None):
+              url = "https://api.github.com" + path
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(url, data=data, method=method)
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              if data:
+                  req.add_header("Content-Type", "application/json")
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as r:
+                      b = r.read()
+                      return r.status, (json.loads(b) if b else {})
+              except urllib.error.HTTPError as e:
+                  return e.code, json.loads(e.read() or b"{}")
+
+          st, _ = api("GET", f"/repos/{repo}/releases/tags/{tag}")
+          if st == 200:
+              print("release already exists")
+          else:
+              body = {
+                  "tag_name": tag,
+                  "name": meta.get("name") or tag,
+                  "body": (meta.get("body") or "")[:60000],
+                  "draft": False,
+                  "prerelease": bool(meta.get("prerelease")),
+              }
+              st, resp = api("POST", f"/repos/{repo}/releases", body)
+              print("create ->", st, resp.get("id") or resp.get("message"))
+              if st not in (200, 201):
+                  raise SystemExit(f"create failed: {st} {resp}")
+          PY
+
+      - name: Upload assets via REST
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release view "$TAG" --json assets \
-            --jq '.assets[] | "\(.name)\t\(.size)\t\(.digest // "no-digest")"' | tee out.txt
-          echo "--- local vs remote size check ---"
           python3 - <<'PY'
-          import json, os, subprocess
-          tag = os.environ["TAG"]
-          remote = json.loads(subprocess.run(
-              ["gh", "release", "view", tag, "--json", "assets"],
-              capture_output=True, text=True, check=True).stdout)["assets"]
-          rmap = {a["name"]: a["size"] for a in remote}
+          import json, os, urllib.parse, urllib.request, urllib.error
+          tag = os.environ["TAG"]; repo = os.environ["REPO"]; token = os.environ["GH_TOKEN"]
+
+          def get_release():
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read())
+
+          rel = get_release()
+          existing = {a["name"]: a["id"] for a in rel.get("assets", [])}
+          upload_base = rel["upload_url"].split("{")[0]
+
+          for name in sorted(os.listdir("dist")):
+              path = os.path.join("dist", name)
+              size = os.path.getsize(path)
+              if name in existing:
+                  # 删除旧资产后重传，避免 clobber 语义差异
+                  dreq = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/releases/assets/{existing[name]}",
+                      method="DELETE")
+                  dreq.add_header("Authorization", f"Bearer {token}")
+                  try:
+                      urllib.request.urlopen(dreq, timeout=120).read()
+                      print(f"  removed old {name}")
+                  except urllib.error.HTTPError as e:
+                      print(f"  remove {name} -> {e.code}")
+              with open(path, "rb") as f:
+                  payload = f.read()
+              url = f"{upload_base}?name={urllib.parse.quote(name)}"
+              req = urllib.request.Request(url, data=payload, method="POST")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Content-Type", "application/octet-stream")
+              with urllib.request.urlopen(req, timeout=1800) as r:
+                  up = json.loads(r.read())
+              print(f"  uploaded {name}: id={up['id']} state={up.get('state')} size={up['size']}")
+              if up["size"] != size:
+                  raise SystemExit(f"size mismatch for {name}")
+          PY
+
+      - name: Verify
+        env:
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tag = os.environ["TAG"]; repo = os.environ["REPO"]; token = os.environ["GH_TOKEN"]
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+          req.add_header("Authorization", f"Bearer {token}")
+          req.add_header("Accept", "application/vnd.github+json")
+          with urllib.request.urlopen(req, timeout=120) as r:
+              rel = json.loads(r.read())
+          remote = {a["name"]: a["size"] for a in rel.get("assets", [])}
           ok = True
-          for f in sorted(os.listdir("dist")):
-              size = os.path.getsize(os.path.join("dist", f))
-              got = rmap.get(f)
-              status = "OK" if got == size else "MISMATCH"
-              if got != size:
+          for name in sorted(os.listdir("dist")):
+              local = os.path.getsize(os.path.join("dist", name))
+              got = remote.get(name)
+              flag = "OK" if got == local else "MISMATCH"
+              if got != local:
                   ok = False
-              print(f"  {f}: local={size} remote={got} {status}")
+              print(f"  {name}: local={local} remote={got} {flag}")
           if not ok:
-              raise SystemExit("size mismatch detected")
+              raise SystemExit("verification failed")
           print("all assets verified")
           PY
